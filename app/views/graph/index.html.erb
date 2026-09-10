@@ -1,0 +1,228 @@
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  #page { display: flex; flex-direction: column; height: 100vh; background: #0f1117; color: #e2e8f0; font-family: system-ui, sans-serif; }
+
+  #toolbar { display: flex; align-items: center; gap: 12px; padding: 10px 16px; border-bottom: 1px solid #1e293b; flex-shrink: 0; }
+  #toolbar h1 { font-size: 14px; font-weight: 500; margin-right: 8px; }
+  button { font-size: 12px; padding: 5px 12px; border-radius: 6px; border: 1px solid #2a2f3d; background: transparent; color: #e2e8f0; cursor: pointer; }
+  button:hover { background: #1e293b; }
+  button.active { background: #6366f1; border-color: #6366f1; color: #fff; }
+  button.danger  { background: #ef4444; border-color: #ef4444; color: #fff; }
+  #hint { font-size: 12px; color: #64748b; margin-left: auto; }
+
+  #main { display: flex; flex: 1; overflow: hidden; }
+
+  #sigma-container { flex: 1; }
+
+  #panel { width: 220px; border-left: 1px solid #1e293b; padding: 14px; font-size: 12px; overflow-y: auto; display: none; flex-direction: column; gap: 8px; }
+  #panel.open { display: flex; }
+  #panel h2 { font-size: 11px; font-weight: 500; color: #64748b; text-transform: uppercase; letter-spacing: .05em; }
+  #panel strong { font-size: 14px; font-weight: 500; display: block; margin-bottom: 4px; }
+  #panel a { color: #6366f1; font-size: 11px; }
+  #edge-list h3 { font-size: 11px; color: #64748b; text-transform: uppercase; margin-bottom: 6px; }
+  .edge-row { display: flex; justify-content: space-between; align-items: center; padding: 3px 0; border-bottom: 1px solid #1e293b; font-size: 11px; }
+  .edge-row:last-child { border: none; }
+  .del { background: none; border: none; color: #ef4444; cursor: pointer; font-size: 14px; padding: 0 2px; }
+</style>
+
+<div id="page">
+  <div id="toolbar">
+    <h1>Documents</h1>
+    <button id="btn-view"  onclick="setMode('view')"  class="active">👁 Vue</button>
+    <button id="btn-link"  onclick="setMode('link')">🔗 Liaison</button>
+    <button class="danger" onclick="clearEdges()">🗑 Liens</button>
+    <button onclick="exportEdges()">⬇ Exporter</button>
+    <span id="hint">Clique sur un nœud pour voir ses infos</span>
+  </div>
+
+  <div id="main">
+    <div id="sigma-container"></div>
+    <div id="panel">
+      <h2>Nœud</h2>
+      <div id="panel-body"></div>
+      <hr style="border-color:#1e293b;margin:4px 0">
+      <div id="edge-list">
+        <h3>Liaisons (<span id="ec">0</span>)</h3>
+        <div id="edge-items"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/graphology@0.25.4/dist/graphology.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/sigma@2.4.0/build/sigma.min.js"></script>
+
+<script>
+// ── Données injectées par Rails ───────────────────────────────
+const POINTS = <%= raw @projected.to_json %>;
+
+// ── Couleur par domaine / mime ────────────────────────────────
+const COLORS = {
+  'sécurité':    '#6366f1',
+  'conformité':  '#f59e0b',
+  'technique':   '#3b82f6',
+  'gouvernance': '#8b5cf6',
+  'default':     '#64748b',
+};
+function colorFor(d) { return COLORS[d] || COLORS.default; }
+
+// ── Graphe ────────────────────────────────────────────────────
+const graph = new graphology.Graph({ multi: false });
+
+POINTS.forEach(p => {
+  graph.addNode(p.id, {
+    label:      p.label,
+    x:          p.x,
+    y:          p.y,
+    size:       8 + Math.min(p.chunks || 1, 8),
+    color:      colorFor(p.domain),
+    drive_link: p.drive_link,
+    chunks:     p.chunks,
+    domain:     p.domain,
+  });
+});
+
+// ── Sigma ─────────────────────────────────────────────────────
+const renderer = new Sigma(graph, document.getElementById('sigma-container'), {
+  renderEdgeLabels: true,
+  labelColor:       { color: '#e2e8f0' },
+  labelSize:        13,
+  edgeLabelSize:    11,
+  defaultEdgeColor: '#334155',
+  defaultEdgeType:  'line',
+});
+
+// ── Mode ──────────────────────────────────────────────────────
+let mode = 'view';
+let linkSource = null;
+let edgeCount  = 0;
+
+function setMode(m) {
+  mode = m;
+  linkSource = null;
+  resetHighlights();
+  document.getElementById('btn-view').className = m === 'view' ? 'active' : '';
+  document.getElementById('btn-link').className = m === 'link' ? 'active' : '';
+  document.getElementById('hint').textContent = m === 'view'
+    ? 'Clique sur un nœud pour voir ses infos'
+    : '① Source  ② Cible — clic sur fond pour annuler';
+}
+
+// ── Clic nœud ────────────────────────────────────────────────
+renderer.on('clickNode', ({ node }) => {
+  if (mode === 'view') { showPanel(node); return; }
+
+  // Mode liaison
+  if (!linkSource) {
+    linkSource = node;
+    highlightNode(node);
+    document.getElementById('hint').textContent =
+      `Source : "${graph.getNodeAttribute(node,'label')}" — clique la cible`;
+    return;
+  }
+
+  if (linkSource === node) {
+    linkSource = null; resetHighlights();
+    document.getElementById('hint').textContent = '① Source  ② Cible';
+    return;
+  }
+
+  // Créer le lien
+  const key = [linkSource, node].sort().join('--');
+  if (!graph.hasEdge(linkSource, node) && !graph.hasEdge(node, linkSource)) {
+    graph.addEdgeWithKey(key, linkSource, node, {
+      label: 'lien',
+      color: '#10b981',
+      size:  2,
+      manual: true,
+    });
+    updateEdgeList();
+  }
+
+  linkSource = null;
+  resetHighlights();
+  document.getElementById('hint').textContent = '① Source  ② Cible';
+});
+
+renderer.on('clickStage', () => {
+  if (mode === 'view') { closePanel(); return; }
+  linkSource = null;
+  resetHighlights();
+  document.getElementById('hint').textContent = '① Source  ② Cible';
+});
+
+// ── Panel info ────────────────────────────────────────────────
+function showPanel(nodeId) {
+  const a = graph.getNodeAttributes(nodeId);
+  const neighbors = graph.neighbors(nodeId);
+  document.getElementById('panel').className = 'open';
+  document.getElementById('panel-body').innerHTML = `
+    <strong>${a.label}</strong>
+    <div style="color:#94a3b8">${a.chunks || '?'} chunks · ${a.domain || ''}</div>
+    ${a.drive_link ? `<a href="${a.drive_link}" target="_blank">Ouvrir Drive ↗</a>` : ''}
+    <div style="margin-top:8px;color:#64748b;font-size:11px">VOISINS (${neighbors.length})</div>
+    ${neighbors.map(n => `<div style="font-size:11px">↳ ${graph.getNodeAttribute(n,'label')}</div>`).join('')}
+  `;
+}
+function closePanel() { document.getElementById('panel').className = ''; }
+
+// ── Liste des liens manuels ───────────────────────────────────
+function updateEdgeList() {
+  const manual = graph.edges().filter(e => graph.getEdgeAttribute(e, 'manual'));
+  document.getElementById('ec').textContent = manual.length;
+  document.getElementById('edge-items').innerHTML = manual.map(e => {
+    const s = graph.getNodeAttribute(graph.source(e), 'label');
+    const t = graph.getNodeAttribute(graph.target(e), 'label');
+    return `<div class="edge-row">
+      <span title="${s} → ${t}">${s.slice(0,16)}… → ${t.slice(0,16)}…</span>
+      <button class="del" onclick="removeEdge('${e}')">×</button>
+    </div>`;
+  }).join('') || '<div style="color:#475569">Aucun</div>';
+}
+
+function removeEdge(e) {
+  if (graph.hasEdge(e)) graph.dropEdge(e);
+  updateEdgeList();
+}
+
+function clearEdges() {
+  graph.edges()
+    .filter(e => graph.getEdgeAttribute(e, 'manual'))
+    .forEach(e => graph.dropEdge(e));
+  updateEdgeList();
+}
+
+// ── Export JSON ───────────────────────────────────────────────
+function exportEdges() {
+  const manual = graph.edges()
+    .filter(e => graph.getEdgeAttribute(e, 'manual'))
+    .map(e => ({
+      source: graph.source(e),
+      target: graph.target(e),
+      source_label: graph.getNodeAttribute(graph.source(e), 'label'),
+      target_label: graph.getNodeAttribute(graph.target(e), 'label'),
+    }));
+  const blob = new Blob([JSON.stringify(manual, null, 2)], { type: 'application/json' });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href = url; a.download = 'graph_edges.json'; a.click();
+}
+
+// ── Highlight ─────────────────────────────────────────────────
+function highlightNode(nodeId) {
+  graph.nodes().forEach(n => {
+    graph.setNodeAttribute(n, 'color',
+      n === nodeId ? '#ffffff'
+      : colorFor(graph.getNodeAttribute(n, 'domain')));
+  });
+}
+function resetHighlights() {
+  graph.nodes().forEach(n =>
+    graph.setNodeAttribute(n, 'color', colorFor(graph.getNodeAttribute(n, 'domain'))));
+}
+
+// Init
+setMode('view');
+updateEdgeList();
+</script>
